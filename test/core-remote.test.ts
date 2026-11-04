@@ -54,7 +54,7 @@ test('every relative import of a remote helper part ships with it', () => {
   const missing: string[] = []
   for (const part of PARTS) for (const { path } of transpiler.scanImports(readFileSync(join(root, part), 'utf8').replace(/^#!.*/, ''))) {
     if (!path.startsWith('.')) continue
-    const target = relative(root, join(root, dirname(part), path))
+    const target = relative(root, join(root, dirname(part), path)).replaceAll('\\', '/')
     if (!PARTS.includes(target)) missing.push(`${part} → ${target}`)
   }
   expect(missing).toEqual([])

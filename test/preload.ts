@@ -16,9 +16,16 @@ for (const n of readdirSync(tmpdir()))
     try {
       if (Date.now() - statSync(join(tmpdir(), n)).mtimeMs > 3_600_000) rmSync(join(tmpdir(), n), { recursive: true, force: true })
     } catch {}
-const home = mkdtempSync(join(tmpdir(), 'shep-test-home-'))
+const parent = mkdtempSync(join(tmpdir(), 'shep-test-home-'))
+// On Windows the home is a folder the app makes itself, with the private access list the core insists on: a folder
+// made here inherits the administrators' access, and the core refuses that home. So the tests get a leaf that does
+// not exist yet inside the folder this run owns, and the whole folder goes at the exit.
+const home = process.platform === 'win32' ? join(parent, 'home') : parent
 process.env.SHEPHERDR_HOME = home
-process.on('exit', () => rmSync(home, { recursive: true, force: true }))
+process.on('exit', () => {
+  // a child that outlived the file can still hold a file here on Windows, and the run has already been judged
+  try { rmSync(parent, { recursive: true, force: true }) } catch {}
+})
 for (const k of ['SHEPHERDR_URL', 'SHEPHERDR_CHAT']) delete process.env[k]
 
 const root = join(import.meta.dir, '..')
@@ -39,6 +46,8 @@ writeRegistries()
 
 /** how this bun was started: bun test runs the preload in the process the command started */
 function command(): string[] {
+  // Windows has neither /proc nor ps, and it never needs them: its bun keeps the command in the arguments.
+  if (process.platform === 'win32') return process.argv
   try {
     return readFileSync('/proc/self/cmdline', 'utf8').split('\0').filter(Boolean)
   } catch {
@@ -49,11 +58,14 @@ function command(): string[] {
 
 // Plain bun test runs the files one at a time in one process, where they share what they import (the store, the
 // settings): slow, and one file's leftovers can fail another. It runs as bun run test instead, the files in parallel,
-// each on its own. --parallel, --isolate and the runner's own workers run as asked.
-const cmd = command()
-const at = cmd.indexOf('test')
-if (!process.env.SHEPHERDR_TEST_RUNNER && at > 0 && !cmd.some((a) => /^--(parallel|isolate|test-worker)\b/.test(a))) {
-  console.log('bun test runs as bun run test here: the files in parallel, each on its own (AGENTS.md).')
-  const r = Bun.spawnSync([process.execPath, join(root, 'scripts', 'test.ts'), ...cmd.slice(at + 1)], { cwd: process.cwd(), stdio: ['inherit', 'inherit', 'inherit'] })
-  process.exit(r.exitCode ?? 1)
+// each on its own. --parallel, --isolate and the runner's own workers run as asked, and a runner that says so
+// (SHEPHERDR_TEST_RUNNER, which scripts/test.ts sets) is already running them that way: it is not looked at.
+if (!process.env.SHEPHERDR_TEST_RUNNER) {
+  const cmd = command()
+  const at = cmd.indexOf('test')
+  if (at > 0 && !cmd.some((a) => /^--(parallel|isolate|test-worker)\b/.test(a))) {
+    console.log('bun test runs as bun run test here: the files in parallel, each on its own (AGENTS.md).')
+    const r = Bun.spawnSync([process.execPath, join(root, 'scripts', 'test.ts'), ...cmd.slice(at + 1)], { cwd: process.cwd(), stdio: ['inherit', 'inherit', 'inherit'] })
+    process.exit(r.exitCode ?? 1)
+  }
 }

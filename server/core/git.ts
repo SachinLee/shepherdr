@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import type { PilotRepositoryContext } from './pilot-repositories.ts'
 import { Refusal } from './client.ts'
 import type { CoreFiles } from './files.ts'
+import { pathRelation, worktreeEntries } from './repository-paths.ts'
 
 export interface RepoLocation { machine: string; folder: string }
 /** Same GitHub host forms as legacy, without importing its worker/SSH transport. */
@@ -56,15 +57,20 @@ export class CoreGit {
   }
   /** Reopen only the saved branch at its saved location; Git refuses occupied paths without overwriting. */
   async ensureWorktree(repo: RepoLocation, folder: string, branch: string, base: string): Promise<boolean> {
-    const blocks = (await this.run(repo, ['worktree', 'list', '--porcelain'])).split('\n\n').map(block => block.split('\n'))
-    const ref = `branch refs/heads/${branch}`
-    const here = blocks.find(lines => lines.includes(`worktree ${folder}`))
-    if (here) {
-      if (!here.includes(ref)) throw Error('The saved task folder now belongs to another branch; it was left untouched')
+    // -z keeps a Windows path with spaces or non-ASCII characters unquoted, so the saved folder can be matched exactly.
+    const entries = worktreeEntries(await this.run(repo, ['worktree', 'list', '--porcelain', '-z']))
+    const ref = `refs/heads/${branch}`
+    const matches = entries.map(entry => ({ entry, match: pathRelation(entry.path, folder) }))
+    if (matches.some(({ match }) => match === 'unknown')) throw Error('The saved task folder could not be compared with this repository; it was left untouched')
+    const here = matches.filter(({ match }) => match === 'same').map(({ entry }) => entry)
+    if (here.length > 1) throw Error('The saved task folder is listed more than once in this repository; it was left untouched')
+    if (here[0]) {
+      if (here[0].branch !== ref) throw Error('The saved task folder now belongs to another branch; it was left untouched')
+      // Git records the folder it created, and only one worktree holds a branch, so this also confirms the object.
       if (await this.run({ machine: repo.machine, folder }, ['symbolic-ref', '--quiet', 'HEAD']) !== `refs/heads/${branch}`) throw Error('The saved task checkout changed; it was left untouched')
       return false
     }
-    if (blocks.some(lines => lines.includes(ref))) throw Error('The saved task branch is checked out elsewhere; it was left untouched')
+    if (entries.some(entry => entry.branch === ref)) throw Error('The saved task branch is checked out elsewhere; it was left untouched')
     if (await this.branchHead(repo, branch)) await this.run(repo, ['worktree', 'add', folder, branch], 60, undefined, [folder])
     else await this.addWorktree(repo, folder, branch, base)
     return true

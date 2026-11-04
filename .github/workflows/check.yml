@@ -6,6 +6,9 @@
 # Lean, as GitHub bills each job by the minute, rounded up: the types and the build share one job, and the tests run
 # split over three runners (bun test --shard, balanced by each file's time on the last run), which also note which
 # lines of the screen each browser test runs. Whatever doesn't change between runs comes from the cache.
+#
+# Windows and macOS run here too: Windows because its gate is a plain, medium-integrity account the Ubuntu runners
+# cannot give (the windows job), macOS because it is the other Unix these rules reach (the macOS job).
 name: Check
 
 on:
@@ -115,3 +118,65 @@ jobs:
         with:
           path: ${{ env.TIMINGS }}
           key: test-timings-${{ github.run_id }}-${{ matrix.shard }}
+
+  # Windows is a job of its own because its gate is a kind of process the Ubuntu runners cannot give: the product
+  # refuses an elevated one, and a GitHub Windows runner is an administrator with UAC off, so the runner's own account
+  # only shows the two refusals (test/core-windows-*.test.ts skip their plain-user tests there). Everything else runs as
+  # a throwaway standard account the job makes, with a plain, medium-integrity token: scripts/windows/ci-host.ps1 makes
+  # the account and hands it a read-only copy of this commit, bun and the fixed core build, and ci-user.ps1 asserts the
+  # token, then installs, typechecks, builds and runs both groups. Neither ever skips: a machine that cannot give an
+  # ordinary user a logon fails here, with why.
+  windows:
+    name: windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      - run: bun install --frozen-lockfile
+      - name: the two refusals only an elevated process shows
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'elevated.log'
+          $names = @(
+            'refuses to relay from an elevated or non-medium-integrity process',
+            'refuses to serve the pipe from an elevated process'
+          )
+          bun run test --timeout=240000 --test-name-pattern ($names -join '|') core-windows-pipe core-windows-operator *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { throw "the elevated refusal tests failed: exit $code" }
+          # a skipped test is not a refusal that ran: the pass of each one is asked for by name
+          foreach ($name in $names) {
+            if (-not (Select-String -LiteralPath $log -Pattern ('\(pass\).*' + [regex]::Escape($name)) -Quiet)) { throw "did not run: $name" }
+          }
+      - name: the ordinary user
+        shell: pwsh
+        run: ./scripts/windows/ci-host.ps1 -Workspace $env:GITHUB_WORKSPACE
+
+  # The other Unix: the files this platform's rules (access lists, pipes, paths, signals) reach, so a Windows fix that
+  # changes a shared seam is seen before it merges. The browser does not run here.
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test core-home core-client core-launcher core-operator core-agents core-worktree core-chat core-artifacts

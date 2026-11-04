@@ -7,6 +7,8 @@ import { CoreSource } from '../server/core/source.ts'
 import type { CoreSpace } from '../server/core/model.ts'
 import { runChild } from './child.ts'
 
+const WINDOWS = process.platform === 'win32'
+
 test('native attachment/reply lines and both reaction sides retain the original message identity', () => {
   const messages = chatMessages([
     { id: 'a', who: 'agent', text: 'The example is ready', at: 1 },
@@ -29,7 +31,9 @@ test('empty replies stay hidden and a file-only message keeps its client receipt
   ])
 })
 
-test('remote uploads cross core in bounded chunks, retain bytes and cannot borrow another chat file', async () => {
+// The remote copy script is POSIX (uid, mode, realpath); the Windows app keeps its uploads in-process instead, which
+// test/core-windows-transfers.test.ts covers.
+test.skipIf(WINDOWS)('remote uploads cross core in bounded chunks, retain bytes and cannot borrow another chat file', async () => {
   const root = mkdtempSync(join(tmpdir(), 'shep-chat-')), source = new CoreSource({ home: join(root, 'app'), port: 17887, session: 'test', socket: '/unused', binary: 'hc' })
   const space: CoreSpace = { id: 'p:remote:~', machine: 'remote', name: '~', home: true, folder: root, base: 'main', prefix: 'TASK', mode: 'regular', added: 1 }
   source.store.set('space', space.id, space)

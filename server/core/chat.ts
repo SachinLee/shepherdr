@@ -3,7 +3,10 @@ import { basename, join } from 'node:path'
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
 import type { Action, Message, Reaction } from '../../shared/types.ts'
 import { agentLines, excerpt, findQuoted, line, parseReply, parseUserLine, userLines } from '../common/chatlines.ts'
+import { fileType } from '../../shared/files.ts'
+import { agentHost } from './agent-platform.ts'
 import type { CoreSource } from './source.ts'
+import { windowsFiles, type WindowsFiles } from './windows-security.ts'
 
 interface Upload { id: string; chat: string; path: string; name: string; copies?: Record<string, string>; paths?: string[] }
 
@@ -52,24 +55,45 @@ export function chatMessages(raw: Message[]): Message[] {
 
 /** Files are uploaded to the app, then copied only to their chat's owning machine through core. */
 export class CoreChat {
-  constructor(private source: CoreSource, private installation: string) {}
+  constructor(private source: CoreSource, private installation: string, private readonly host: NodeJS.Platform = process.platform,
+    private readonly files: WindowsFiles = windowsFiles) {}
+  /** A local Windows app keeps its uploads behind the private-state helper; POSIX and remote paths are unchanged. */
+  private get windows() { return agentHost(false, this.host) === 'windows' }
   private records() { return this.source.store.all<Upload>('upload') }
   async upload(chat: string, name: string, bytes: Uint8Array) {
     if (!this.source.chat(chat)) throw new Error('No such chat')
     if (bytes.length > 32 * 1024 * 1024) throw new Error('Attachment is too large')
+    if (this.windows && (!name || /[<>:"/\\|?*\x00-\x1f]/.test(name) || /[. ]$/.test(name)
+      || /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name))) throw new Error('Attachment needs a valid Windows file name')
     const clean = basename(name).replace(/[\r\n\x00-\x1f]/g, '').replace(/"/g, '”').slice(0, 180) || 'attachment'
-    const directory = join(this.source.config.home, 'uploads'); mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const directory = join(this.source.config.home, 'uploads')
     const id = randomUUID(), path = join(directory, id + '-' + clean)
-    writeFileSync(path, bytes, { mode: 0o600, flag: 'wx' })
+    if (this.windows) {
+      this.files.preparePrivateDirectory(directory)
+      this.files.writePrivateFile(path, bytes, { exclusive: true })
+    } else {
+      mkdirSync(directory, { recursive: true, mode: 0o700 })
+      writeFileSync(path, bytes, { mode: 0o600, flag: 'wx' })
+    }
     this.source.store.set('upload', id, { id, chat, path, name: clean } satisfies Upload)
     return path
   }
   uploadName(chat: string, path: string) { return this.records().find(item => item.chat === chat && item.path === path)?.name }
   async attachment(chat: string, path: string) {
     const record = this.records().find(item => item.chat === chat && (item.path === path || [...Object.values(item.copies ?? {}), ...(item.paths ?? [])].includes(path)))
-    return record ? new Blob([this.read(record)], { type: Bun.file(record.path).type }) : null
+    if (!record) return null
+    const bytes = this.read(record)
+    // A Blob takes bytes backed by a real ArrayBuffer; a pooled Buffer is copied into one plain Uint8Array. The type
+    // comes from the name this app stored, not from a fresh look at the path, and the download route derives its own.
+    const part = new Uint8Array(bytes.byteLength)
+    part.set(bytes)
+    return new Blob([part], { type: fileType(record.name).type })
   }
   private read(record: Upload) {
+    if (this.windows) {
+      try { return this.files.readPrivateFileBytes(record.path, 32 * 1024 * 1024) }
+      catch (error) { throw new Error('Attachment is no longer a regular uploaded file', { cause: error }) }
+    }
     const fd = openSync(record.path, constants.O_RDONLY | constants.O_NOFOLLOW)
     try { const stat = fstatSync(fd); if (!stat.isFile() || stat.nlink !== 1 || stat.size > 32 * 1024 * 1024) throw new Error('Attachment is no longer a regular uploaded file'); return readFileSync(fd) }
     finally { closeSync(fd) }

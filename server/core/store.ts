@@ -3,6 +3,7 @@ import { chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { prepareHome } from './home.ts'
+import { WindowsSecurityError, writePrivateFile } from './windows-security.ts'
 import { CoreError } from './client.ts'
 
 /** How long a statement waits out another connection's lock. The wait blocks the app's one thread, so it stays short:
@@ -15,8 +16,18 @@ export class CoreStore {
   constructor(readonly home: string) {
     prepareHome(home)
     const path = join(home, 'state.sqlite')
+    if (process.platform === 'win32') {
+      // SQLite opens by path, so this is pre-open validation only: the protected parent is what keeps other ordinary
+      // accounts out, and same-account processes are the trusted boundary. A fresh file is created private first; an
+      // existing one is opened and checked by the helper before SQLite may follow it (no reparse, no extra link, own ACL).
+      try {
+        writePrivateFile(path, '', { exclusive: true })
+      } catch (error) {
+        if (!(error instanceof WindowsSecurityError) || error.code !== 'EEXIST') throw error
+      }
+    }
     this.db = new Database(path, { create: true })
-    chmodSync(path, 0o600)
+    if (process.platform !== 'win32') chmodSync(path, 0o600)
     this.db.exec(`PRAGMA busy_timeout=${LOCK_WAIT}; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS records (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,key));
       CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, hash TEXT NOT NULL, result TEXT, error TEXT);

@@ -5,6 +5,10 @@ Standalone 2.1 installation and service instructions. See the
 for accepted, unverified limits. Stop and preserve legacy writers/state through the
 [cutover runbook](cutover.md) before creating the fresh installation.
 
+For the experimental native Windows path and its outstanding acceptance gates,
+use the [Windows preview instructions](windows.md). The Unix service examples
+below do not apply to that path.
+
 ## Requirements and installation
 
 - Bun 1.4.2 (the CI-pinned version), Git, and herdr-core **0.1.14 or newer**, generation 1. A core that herdr-app or

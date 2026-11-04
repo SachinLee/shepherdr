@@ -1,14 +1,17 @@
 import { tag as chatTag } from '../common/chatlines.ts'
 import { age } from '../common/age.ts'
 import { randomBytes } from 'node:crypto'
-import { dirname, join, basename } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { basename, join, resolve, win32 } from 'node:path'
+import { readFileSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { artifactChecker, taskArtifactTitle, titleCase, type Checker, type CheckResult } from '../artifact-check.ts'
 import { wrapPage } from '../frame.ts'
 import { one, parseArgs } from '../common/args.ts'
 import { browserNamespace } from './browser-id.ts'
 import { Refusal } from './client.ts'
 import { coreSpaceName, findCoreSpace } from './space-names.ts'
+import { agentHost } from './agent-platform.ts'
+import { windowsFiles, type WindowsFiles } from './windows-security.ts'
 import type { CoreSource } from './source.ts'
 import type { CoreAgent } from './model.ts'
 import type { Action, Artifact } from '../../shared/types.ts'
@@ -22,7 +25,8 @@ const IMAGE_TYPES: { [ext: string]: string } = { png: 'image/png', jpg: 'image/j
 export class CoreArtifacts {
   checker: Checker
   private updating = new Set<string>()
-  constructor(private source: CoreSource, private installation: string) {
+  constructor(private source: CoreSource, private installation: string, private readonly host: NodeJS.Platform = process.platform,
+    private readonly files: WindowsFiles = windowsFiles) {
     this.checker = artifactChecker(source.config.home, async args => {
       try {
         const home = source.spaces().find(space => space.home && space.machine === source.localMachineId())
@@ -74,8 +78,44 @@ export class CoreArtifacts {
   }
   thumb(id: string, dark: boolean) { this.get(id); const data = this.source.store.get<string>('artifact-thumb', `${id}:${dark ? 'dark' : 'light'}`); return data ? new Blob([Buffer.from(data, 'base64')], { type: 'image/png' }) : null }
 
+  /** A local Windows app reads and writes through the helper; anywhere else keeps the inline script through core. */
+  private async local(agent: CoreAgent) {
+    if (agentHost(false, this.host) !== 'windows') return false
+    // route() throws for a machine core does not know or has lost; that refusal is the answer, not a guess that the
+    // machine speaks POSIX, so it is never swallowed here.
+    return (await this.source.route(agent.machine)) === undefined
+  }
+  /**
+   * The helper's canonical final path is what this policy sees, never a path we resolved beforehand: home and its
+   * private leaves, the provider state and other private folders never import. Comparison is the Windows one, so
+   * case, separator and 8.3 spellings cannot walk around it.
+   */
+  private excluded(canonical: string, image: boolean) {
+    // A canonical Windows path always uses backslashes; mapping a slash-written path onto that form keeps the same
+    // comparison on a test process whose filesystem spells paths with '/'.
+    const flat = (value: string) => {
+      const normalized = win32.normalize(value.replace(/\//g, '\\'))
+      return (normalized.length > 3 ? normalized.replace(/\\+$/, '') : normalized).toLowerCase()
+    }
+    const root = (value: string) => { try { return flat(realpathSync.native(value)) } catch { return flat(value) } }
+    const within = (file: string, base: string) => file === base || file.startsWith(base.endsWith('\\') ? base : base + '\\')
+    const home = root(this.source.config.home), file = flat(canonical)
+    const leaves = ['inbox', 'uploads', 'artifacts', 'exports', ...(image ? ['checks'] : [])]
+    for (const candidate of [this.source.config.home, join(homedir(), '.shepherdr'), join(homedir(), '.shepherdr-legacy'), join(homedir(), '.local/share/shepherdr-agents'), join(homedir(), '.codex'), join(homedir(), '.claude'), join(homedir(), '.ssh')]) {
+      const base = root(candidate)
+      if (!within(file, base)) continue
+      if (base === home && leaves.some(dir => within(file, root(join(this.source.config.home, dir))))) continue
+      return true
+    }
+    return false
+  }
   private async read(agent: CoreAgent, path: string, cwd: string, max: number, image = false): Promise<Buffer> {
     if (agent.pilot) return Buffer.from(await this.contained(agent, { op: 'read', path, max }), 'base64')
+    if (await this.local(agent)) {
+      const read = this.files.readPlainFile(resolve(cwd, path), max)
+      if (this.excluded(read.path, image)) throw new Refusal('Private files cannot be imported into artifacts')
+      return read.bytes
+    }
     const bun = await this.source.agents.bun(agent.machine)
     const script = `const f=require('node:fs'),p=require('node:path'),o=require('node:os'),x=JSON.parse(await Bun.stdin.text());const file=f.realpathSync(p.resolve(x.cwd,x.path));const within=(file,root)=>file===root||file.startsWith(root+p.sep);for(let root of [x.home,p.join(o.homedir(),'.shepherdr'),p.join(o.homedir(),'.shepherdr-legacy'),p.join(o.homedir(),'.local/share/shepherdr-agents'),p.join(o.homedir(),'.codex'),p.join(o.homedir(),'.claude'),p.join(o.homedir(),'.ssh')]){try{root=f.realpathSync(root)}catch{}if(within(file,root)&&!(root===x.home&&['inbox','uploads','artifacts',...(x.image?['checks']:[])].some(dir=>within(file,p.join(root,dir)))))throw Error('Private files cannot be imported into artifacts')};const fd=f.openSync(file,f.constants.O_RDONLY|f.constants.O_NOFOLLOW);try{const s=f.fstatSync(fd);if(!s.isFile()||s.nlink>1||s.size>x.max)throw Error('Artifact input is not a regular file under the size limit');const b=f.readFileSync(fd);if(b.length>x.max)throw Error('Artifact input grew past its size limit');process.stdout.write(b.toString('base64'))}finally{f.closeSync(fd)}`
     return Buffer.from((await this.source.files.exec(agent.machine, [bun, '-e', script], undefined, Buffer.from(JSON.stringify({ path, cwd, max, image, home: this.source.config.home })))).toString('utf8'), 'base64')
@@ -121,6 +161,13 @@ export class CoreArtifacts {
   }
   private async export(agent: CoreAgent, name: string, bytes: Uint8Array) {
     if (agent.pilot) return this.contained(agent, { op: 'export', name, data: Buffer.from(bytes).toString('base64') })
+    if (await this.local(agent)) {
+      const directory = join(this.source.config.home, 'exports')
+      this.files.preparePrivateDirectory(directory)
+      const file = join(directory, `${randomBytes(6).toString('hex')}-${basename(name)}`)
+      this.files.writePrivateFile(file, bytes, { exclusive: true })
+      return file
+    }
     const bun = await this.source.agents.bun(agent.machine)
     const script = `const f=require('node:fs'),p=require('node:path'),o=require('node:os'),x=JSON.parse(await Bun.stdin.text());const dir=p.join(o.homedir(),'.cache/shepherdr-artifacts',x.id);f.mkdirSync(dir,{recursive:true,mode:0o700});const s=f.lstatSync(dir);if(!s.isDirectory()||s.isSymbolicLink()||(s.mode&0o077)||s.uid!==process.getuid()||f.realpathSync(dir)!==dir)throw Error('Artifact exports need a private real directory');const file=p.join(dir,x.name);f.writeFileSync(file,Buffer.from(x.data,'base64'),{mode:0o600,flag:'wx'});process.stdout.write(file)`
     const id = this.installation

@@ -1,8 +1,13 @@
 // Stateless native worktree reader. Executed through documented core machine.exec; no listener or worker.
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { isAbsolute, join, relative, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { lstatSync, realpathSync, statSync, openSync, closeSync, readSync, fstatSync, constants } from 'node:fs'
 import type { Diff, DiffFile, FileText, Patch, PullRequest, PrCheck, TreeFiles, WorktreeAsk } from '../shared/types.ts'
+
+const WINDOWS = process.platform === 'win32'
+/** Windows reads go through the security helper, which is imported only where the branch runs. */
+const windowsSecurity = () => import('../server/core/windows-security.ts')
+
 
 interface CheckedRepository { repo: string; writableRoots: string[]; bun: string; helper: string }
 const checkedRepository = new AsyncLocalStorage<CheckedRepository>()
@@ -46,6 +51,34 @@ function readHead(path: string, max: number) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try { const stat = fstatSync(fd); if (!stat.isFile() || stat.nlink !== 1) throw Error('No such file.'); const bytes = Buffer.alloc(max); const n = readSync(fd, bytes, 0, max, 0); return bytes.subarray(0, n) } finally { closeSync(fd) }
 }
+/** Windows folds case and separators and drops trailing dots and spaces, so a plain prefix is not proof of a place. */
+const winParts = (path: string) => path.replaceAll('\\', '/').split('/').filter((part) => part !== '').map((part) => part.replace(/[. ]+$/, '').toLowerCase())
+const winInside = (root: string, path: string) => {
+  const a = winParts(root), b = winParts(path)
+  return a.length > 0 && b.length > a.length && a.every((part, index) => part === b[index])
+}
+/** The volume and object a name resolves to now, so a redirected parent cannot pass as the saved one. */
+function sameObject(left: string, right: string) {
+  try {
+    const a = statSync(left, { bigint: true }), b = statSync(right, { bigint: true })
+    return a.dev === b.dev && a.ino === b.ino && (a.ino !== 0n || a.dev !== 0n)
+  } catch { return false }
+}
+const sameLocation = (left: string, right: string) => WINDOWS ? sameObject(left, right) : left === right
+/**
+ * Read a listed file through the Windows security helper: it holds every ancestor and the leaf, refuses reparse
+ * points and second links, and answers with the canonical path of the object it read. The boundary is that
+ * canonical path inside the worktree root, plus the identity of the directory this name resolves to now.
+ */
+async function insideWindows(wt: string, rel: string, max: number) {
+  const root = realpathSync(wt), expected = join(root, rel)
+  const { readPlainFileHead } = await windowsSecurity()
+  let read: { path: string; bytes: Buffer; size: number }
+  try { read = readPlainFileHead(expected, Math.min(Math.max(max, 1), MAX_BYTES)) } catch { throw new Error('No such file.') }
+  if (!winInside(root, read.path) || winInside(join(root, '.git'), read.path)) throw new Error('No such file.')
+  if (!sameObject(dirname(expected), dirname(read.path))) throw new Error('No such file.')
+  return read
+}
 const noChecksAccess = (said: string) => /not accessible by personal access token/i.test(said)
 async function actionJobs(g: { host: string; repo: string }, cwd: string, sha: string) {
   const gh = (...args: string[]) => sh(['gh', ...args], cwd, { env: { GH_HOST: g.host }, timeoutMs: 15000 })
@@ -72,8 +105,14 @@ export function safeRel(path: unknown): string {
   if (typeof path !== 'string' || !path || path.length > 4096 || path.includes('\0') || isAbsolute(path) || path.includes('\\')) throw new Error('No such file.')
   const parts = path.split('/')
   if (parts.some((p) => !p || p === '.' || p === '..') || parts[0] === '.git') throw new Error('No such file.')
+  // Windows also folds a stream, a device name and a trailing dot or space onto another object: refuse those names
+  // here, before they are joined to a real directory. POSIX keeps them as ordinary file names.
+  if (WINDOWS && (/^[A-Za-z]:/.test(path) || parts.some((part) => part.includes(':') || /[. ]$/.test(part) || RESERVED.test(part)))) throw new Error('No such file.')
   return path
 }
+
+/** names Windows reserves for devices, with or without an extension */
+const RESERVED = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i
 
 /** git with its pathspecs taken literally: a path with * or : in it is only that path */
 const lit = (cwd: string, ...args: string[]) => sh(['git', ...(args[0] === 'diff' ? ['diff', '--no-ext-diff', '--no-textconv', ...args.slice(1)] : args)], cwd, { env: { GIT_LITERAL_PATHSPECS: '1' }, timeoutMs: 20_000 })
@@ -94,6 +133,12 @@ export async function listFiles(wt: string): Promise<TreeFiles> {
 export async function readFile(wt: string, path: unknown): Promise<FileText> {
   const rel = safeRel(path)
   if (!(await listed(wt, rel))) throw new Error('No such file.')
+  if (WINDOWS) {
+    // Windows reads through the held handle, so a link or a second name cannot swap the object under the bytes.
+    const read = await insideWindows(wt, rel, MAX_BYTES)
+    if (isBinary(read.bytes)) return { path: rel, size: read.size, binary: true }
+    return { path: rel, size: read.size, text: new TextDecoder().decode(read.bytes), tooBig: read.size > MAX_BYTES || undefined }
+  }
   const real = inside(wt, rel)
   // a link is read only when what it leads to is listed too: never an ignored file (.env) through a link to it
   const to = relative(realpathSync(wt), real).split(sep).join('/')
@@ -102,6 +147,11 @@ export async function readFile(wt: string, path: unknown): Promise<FileText> {
   const head = readHead(real, Math.min(size, MAX_BYTES))
   if (isBinary(head)) return { path: rel, size, binary: true }
   return { path: rel, size, text: new TextDecoder().decode(head), tooBig: size > MAX_BYTES || undefined }
+}
+
+/** the first bytes of a listed file: through the held Windows handle, or through the held POSIX descriptor */
+async function headOf(wt: string, rel: string, max: number) {
+  return WINDOWS ? (await insideWindows(wt, rel, max)).bytes : readHead(inside(wt, rel), max)
 }
 
 /** git lists the path in the worktree: tracked, or new and not ignored */
@@ -131,9 +181,37 @@ const STATUS: Record<string, DiffFile['status']> = { A: 'added', M: 'modified', 
 async function safeContents(wt: string) {
   const listed = await lit(wt, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')
   if (!listed.ok) throw Error('Could not validate the worktree files')
+  const root = WINDOWS ? realpathSync(wt) : undefined
+  const parents = new Set<string>()
   for (const path of nulSplit(listed.out)) {
-    try { if (lstatSync(join(wt, path)).isFile()) inside(wt, path) }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw Error('The worktree contains a file outside its readable boundary') }
+    try {
+      const stat = lstatSync(join(wt, path))
+      if (WINDOWS) {
+        // Git reads a link's target name, not the object; a second name or a junction in the parents could make it
+        // read an object outside the checkout, and both are refused rather than resolved away.
+        if (stat.isSymbolicLink()) continue
+        if (stat.isFile() && stat.nlink !== 1) throw new Error('linked')
+        if (!stat.isFile()) continue
+        plainParents(root!, path, parents)
+        const real = realpathSync(join(root!, path))
+        if (!winInside(root!, real) || winInside(join(root!, '.git'), real)) throw new Error('outside')
+      } else if (stat.isFile()) inside(wt, path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw Error('The worktree contains a file outside its readable boundary')
+    }
+  }
+}
+
+/** every parent directory of a listed file is a real one: a junction in the chain is refused, not followed */
+function plainParents(root: string, rel: string, seen: Set<string>) {
+  let current = root
+  for (const part of rel.split('/').slice(0, -1)) {
+    current = join(current, part)
+    if (seen.has(current)) continue
+    const stat = lstatSync(current)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not a plain directory')
+    seen.add(current)
   }
 }
 
@@ -184,7 +262,7 @@ export async function diffFiles(wt: string, base: string): Promise<Diff> {
         files.set(path, { ...f, add: 1 })
         continue
       }
-      const head = readHead(inside(wt, path), MAX_BYTES)
+      const head = await headOf(wt, path, MAX_BYTES)
       if (isBinary(head)) f.binary = true
       else f.add = lineCount(new TextDecoder().decode(head))
     } catch {
@@ -274,7 +352,11 @@ async function readWorktreeAt(ask: { folder: string; base: string; branch: strin
   let root: string
   try { root = realpathSync(ask.folder) } catch { throw Error('This task worktree is no longer available') }
   const top = await git(root, 'rev-parse', '--show-toplevel')
-  if (!top.ok || realpathSync(top.out.trim()) !== root) throw Error('The task worktree is no longer available')
+  // Git prints forward slashes and may echo another drive case: the object git names must be the one we resolved.
+  if (!top.ok) throw Error('The task worktree is no longer available')
+  let named: string
+  try { named = realpathSync(top.out.trim()) } catch { throw Error('The task worktree is no longer available') }
+  if (!sameLocation(root, named)) throw Error('The task worktree is no longer available')
   if (ask.what === 'files') return listFiles(root)
   if (ask.what === 'file') return readFile(root, ask.path)
   if (ask.what === 'diff') return diffFiles(root, ask.base)
@@ -285,4 +367,16 @@ async function readWorktreeAt(ask: { folder: string; base: string; branch: strin
 
 export async function readWorktree(ask: Parameters<typeof readWorktreeAt>[0] & { checked?: CheckedRepository }) {
   return checkedRepository.run(ask.checked!, () => readWorktreeAt(ask))
+}
+
+// The file CLI, for a local Windows machine whose inline `-e` script cannot carry the security imports. The POSIX
+// remote keeps the inline form: it prepends `globalThis.__shepherdrWorktreeEval = true`, so this block stays quiet
+// there even though its stdin carries the same request.
+if (import.meta.main && !(globalThis as { __shepherdrWorktreeEval?: boolean }).__shepherdrWorktreeEval) {
+  try {
+    const answer = await readWorktree(JSON.parse(await Bun.stdin.text()))
+    process.stdout.write(JSON.stringify({ ok: true, value: answer }))
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ ok: false, error: (error as Error).message }))
+  }
 }

@@ -656,6 +656,61 @@ test('automatic finished cleanup retains a checkout used by an unrelated core te
   })
 })
 
+test('an unfamiliar or duplicate worktree listing never authorises removing a task', async () => {
+  await withTask(async ({ tasks, task, grant, repo, worktree, git, state }) => {
+    git(worktree, 'reset', '--hard', 'main')
+    await tasks.ready(grant, task.id, 'Answer completed')
+    const source = (tasks as unknown as { source: CoreSource }).source
+    const exec = source.files.exec.bind(source.files)
+    let listing: string | undefined
+    source.files.exec = async (machine, argv, cwd, input, timeout) => {
+      if (listing !== undefined && argv[0] === 'git' && argv[1] === 'worktree' && argv[2] === 'list') return Buffer.from(listing)
+      return exec(machine, argv, cwd, input, timeout)
+    }
+    const ref = 'refs/heads/work/1-example', head = await tasks.git.branchHead({ machine: task.machine, folder: repo }, task.branch)
+    finishableTask(tasks, state)
+    // A path form this code cannot compare is refused, and the checkout and branch stay.
+    listing = `worktree \\\\?\\${worktree}\0HEAD ${head}\0branch ${ref}\0\0`
+    await tasks.tick()
+    expect(existsSync(worktree)).toBe(true)
+    expect(tasks.get(task.id)).toMatchObject({ cleanupPending: true, cleanupError: expect.stringContaining('could not be compared') })
+    expect(await tasks.git.branchHead({ machine: task.machine, folder: repo }, task.branch)).toBe(head)
+    // Two entries for one saved folder are ambiguous, so neither the worktree nor the branch is touched.
+    listing = `worktree ${worktree}\0HEAD ${head}\0branch ${ref}\0\0worktree ${worktree}\0HEAD ${head}\0branch ${ref}\0\0`
+    source.store.set('task', task.id, { ...tasks.get(task.id)!, cleanupChecked: 0 })
+    await tasks.tick()
+    expect(existsSync(worktree)).toBe(true)
+    expect(tasks.get(task.id)).toMatchObject({ cleanupPending: true, cleanupError: expect.stringContaining('listed more than once') })
+    expect(await tasks.git.branchHead({ machine: task.machine, folder: repo }, task.branch)).toBe(head)
+    // The branch is checked out somewhere the task does not own: its commits are not this task's to delete.
+    listing = `worktree ${join(repo, 'other-checkout')}\0HEAD ${head}\0branch ${ref}\0\0`
+    source.store.set('task', task.id, { ...tasks.get(task.id)!, cleanupChecked: 0 })
+    await tasks.tick()
+    expect(existsSync(worktree)).toBe(true)
+    expect(tasks.get(task.id)).toMatchObject({ cleanupPending: true, cleanupError: expect.stringContaining('checked out elsewhere') })
+    expect(await tasks.git.branchHead({ machine: task.machine, folder: repo }, task.branch)).toBe(head)
+    listing = undefined
+    source.store.set('task', task.id, { ...tasks.get(task.id)!, cleanupChecked: 0 })
+    await tasks.tick(); expect(existsSync(worktree)).toBe(false)
+  })
+})
+
+test('a terminal folder that cannot be compared still keeps the finished checkout', async () => {
+  await withTask(async ({ tasks, task, grant, worktree, git, state }) => {
+    git(worktree, 'reset', '--hard', 'main')
+    await tasks.ready(grant, task.id, 'Answer completed')
+    const source = finishableTask(tasks, state)
+    const other = { address: 't9', state: 'live', cwd: 'a folder this machine did not resolve', pid: 99, created_ms: 99, labels: {} } as import('../server/core/protocol.ts').CoreTerminal
+    ;(source.core.current.terminals as Map<string, typeof other>).set('t9', other)
+    await tasks.tick()
+    expect(existsSync(worktree)).toBe(true)
+    expect(tasks.get(task.id)).toMatchObject({ cleanupPending: true, cleanupError: expect.stringContaining('Another core terminal') })
+    other.state = 'finished'
+    source.store.set('task', task.id, { ...tasks.get(task.id)!, cleanupChecked: 0 })
+    await tasks.tick(); expect(existsSync(worktree)).toBe(false)
+  })
+})
+
 test('deferred cleanup removes an exact squashed task branch while preserving its merge on main', async () => {
   await withTask(async ({ tasks, task, grant, repo, worktree, state }) => {
     await tasks.ready(grant, task.id, 'Changed example')

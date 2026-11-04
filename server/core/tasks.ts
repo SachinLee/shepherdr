@@ -11,6 +11,7 @@ import { CoreTaskProcesses } from './task-processes.ts'
 import { mergeWords, taskOptions, validateTaskSettings } from './task-options.ts'
 import { CLI_NAME, kindOf } from './settings.ts'
 import { CoreGit } from './git.ts'
+import { pathRelation, worktreeEntries } from './repository-paths.ts'
 import { checkWords } from './github-pr.ts'
 import { pickSpeed } from '../common/restart.ts'
 import type { CoreSource } from './source.ts'
@@ -206,7 +207,7 @@ export class CoreTasks {
       task.includesPending = true
       this.save(task) // Number and record survive a failed worktree/agent start; never reuse their branch number.
       try {
-        await this.source.files.exec(space.machine, ['mkdir', '-p', join(folder, '..')])
+        // `git worktree add` creates the missing parents itself, so no shell helper is needed for that.
         await this.git.addWorktree({ machine: space.machine, folder: space.folder }, folder, branch, task.base!)
         await this.launchNow(task, undefined, task.model, task.effort)
       } catch (error) { task.startError = (error as Error).message; task.workflow = 'todo'; delete task.reservedAt; this.save(task); throw new Refusal(`${task.id} was saved but could not start: ${task.startError}\nDo not add it again. Read task show ${task.id} before deciding its next step.`) }
@@ -673,17 +674,25 @@ export class CoreTasks {
   }
   private async held(task: CoreTask) {
     const repo = { machine: task.machine, folder: task.repo }
-    const list = await this.git.run(repo, ['worktree', 'list', '--porcelain'])
-    const block = list.split('\n\n').find(block => block.split('\n').includes(`worktree ${task.folder}`))
-    if (block && !block.split('\n').includes(`branch refs/heads/${task.branch}`)) throw new Refusal('This worktree now belongs to another branch; it was left untouched')
+    const entries = worktreeEntries(await this.git.run(repo, ['worktree', 'list', '--porcelain', '-z']))
+    const matches = entries.map(entry => ({ entry, match: pathRelation(entry.path, task.folder) }))
+    // A folder the saved path cannot be compared with is unknown, and unknown work never authorises a removal.
+    if (matches.some(({ match }) => match === 'unknown')) throw new Refusal('This task folder could not be compared with the repository; its work was left untouched')
+    const here = matches.filter(({ match }) => match === 'same').map(({ entry }) => entry)
+    if (here.length > 1) throw new Refusal('This task folder is listed more than once in the repository; its work was left untouched')
+    const entry = here[0]
+    const ref = `refs/heads/${task.branch}`
+    if (entry && entry.branch !== ref) throw new Refusal('This worktree now belongs to another branch; it was left untouched')
+    // Another worktree holding this branch keeps it: deleting the ref would break that checkout.
+    if (!entry && entries.some(other => other.branch === ref)) throw new Refusal('This task branch is checked out elsewhere; its work was left untouched')
     const held: string[] = []
-    if (block && !await this.git.clean({ machine: task.machine, folder: task.folder })) held.push('uncommitted changes')
+    if (entry && !await this.git.clean({ machine: task.machine, folder: task.folder })) held.push('uncommitted changes')
     const head = await this.git.branchHead(repo, task.branch)
     if (head && !await this.git.contains(repo, task.base!, head)) {
       const squashed = task.workflow === 'merged' && task.readyHead === head && task.mergeCommit && await this.git.contains(repo, task.base!, task.mergeCommit)
       if (!squashed) held.push('unmerged commits')
     }
-    return { held, worktree: !!block, branch: !!head }
+    return { held, worktree: !!entry, branch: !!head }
   }
   private async stopAgents(task: CoreTask, forgetBrowser = false) { await new CoreTaskProcesses(this.source).stop(task, true, forgetBrowser) }
   async stop(grant: Grant, id: string) {
@@ -731,7 +740,7 @@ export class CoreTasks {
     const name = this.source.machineName?.(task.machine)
     const holder = [...this.source.core.current.terminals.values()].find(terminal => terminal.state !== 'finished' &&
       (terminal.address.includes('/') ? terminal.address.slice(0, terminal.address.indexOf('/')) : undefined) === name &&
-      (terminal.cwd === task.folder || terminal.cwd?.startsWith(task.folder + '/')))
+      terminal.cwd !== undefined && pathRelation(task.folder, terminal.cwd) !== 'outside')
     if (holder) throw new Refusal('Another core terminal still uses this worktree; its work was kept')
     const repo = { machine: task.machine, folder: task.repo }, head = state.branch ? await this.git.head(repo, task.branch) : undefined
     const squashed = task.workflow === 'merged' && head === task.readyHead && task.mergeCommit && await this.git.contains(repo, task.base, task.mergeCommit)

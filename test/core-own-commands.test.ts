@@ -27,6 +27,15 @@ test('a path a rule cannot state literally gets no rule rather than a wider one'
   for (const path of ['/opt/*/shepherdr', '/opt/a(b)/shepherdr', `/opt/a'b/shepherdr`, '/opt/a"b/shepherdr', '/opt/$a/shepherdr']) expect(ownRules(path)).toEqual([])
 })
 
+test('a Windows path gets no rule and no own-command match, never a widened one', () => {
+  for (const path of ['C:\\Shep\\bin\\shepherdr.cmd', 'C:\\My Projects\\bin\\shepherdr', '\\\\server\\share\\shepherdr']) {
+    expect(ownRules(path)).toEqual([])
+    expect(ownCommand(path, 'Bash', { command: `${path} ask x` })).toBe(false)
+  }
+  // Neither a Windows shell tool nor a non-Bash name is Claude's Bash matcher, so nothing is pre-approved.
+  expect(ownCommand('C:\\Shep\\bin\\shepherdr', 'PowerShell', { command: 'C:\\Shep\\bin\\shepherdr ask x' })).toBe(false)
+})
+
 test('a path with a space is allowed as it must be written, quoted', () => {
   const path = '/home/me/My Projects/bin/shepherdr', rules = ownRules(path)
   expect(rules).toContain(`Bash('${path}' ask:*)`)

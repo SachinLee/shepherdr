@@ -4,12 +4,17 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { modeCard } from '../../shared/types.ts'
 import type { CorePilotConfig, CorePilotRun, PilotHarness } from './pilot-policy.ts'
+import { AUTOPILOT_WINDOWS } from './agent-platform.ts'
 
 /** Stop authority first; process cleanup is retried from private launch records after reconnect/restart. */
 export class CorePilotLifecycle {
   private transitions = new Map<string, Promise<void>>()
-  constructor(private source: CoreSource) {}
+  constructor(private source: CoreSource, private readonly platform: NodeJS.Platform = process.platform) {}
   busy(place: string) { return this.transitions.has(place) }
+  /** Autopilot isolates with a Linux namespace. This host has none, so refuse before a policy, a mode, a grant or a terminal. */
+  private nativeWindows(space: CoreSpace) {
+    return this.platform === 'win32' && space.machine === this.source.store.get<{ id: string }>('meta', 'local')?.id
+  }
   private transition(place: string, work: () => Promise<void>) {
     const old = this.transitions.get(place)
     if (old) return old
@@ -19,6 +24,7 @@ export class CorePilotLifecycle {
   start(place: string, config: CorePilotConfig) {
     const space = this.source.space(place)
     if (!space || space.home) throw Error('Autopilot needs a repository space; home spaces are not isolated projects')
+    if (this.nativeWindows(space)) throw Error(AUTOPILOT_WINDOWS)
     const blocked = this.source.settings.pilotBlock(place)
     if (blocked) throw Error(blocked)
     if (this.busy(place) || this.source.pilots.completion?.busy(place)) throw Error('The coordinator is changing; try again shortly')
@@ -57,6 +63,7 @@ export class CorePilotLifecycle {
     if (this.busy(place)) throw Error('The coordinator is changing; try again shortly')
     const space = this.source.space(place), run = this.source.pilots.policy.current(place), old = this.source.agents.get(place)
     if (!space || !run || run.state !== 'on' || old?.pilot?.run !== run.id) throw Error('No active contained coordinator to restart')
+    if (this.nativeWindows(space)) throw Error(AUTOPILOT_WINDOWS)
     const pick = harness ?? run.config.harness
     if (!['claude', 'codex'].includes(pick.kind) || [pick.model, pick.effort].some(value => value !== undefined && (typeof value !== 'string' || value.length > 512))) throw Error('Choose Claude Code or Codex and its model/effort')
     this.source.pilots.policy.detachCoordinator(run.id)

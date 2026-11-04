@@ -6,7 +6,9 @@ import { randomUUID } from 'node:crypto'
 import { CoreSource } from '../server/core/source.ts'
 import { operatorRequest, startOperator } from '../server/core/operator.ts'
 
-test('private operator socket writes via the server vault and refuses insecure socket permissions', async () => {
+// The POSIX half. Windows has no private socket with a 0600 mode; its operator is a named pipe with a protected DACL,
+// verified in test/core-windows-operator.test.ts.
+test.skipIf(process.platform === 'win32')('private operator socket writes via the server vault and refuses insecure socket permissions', async () => {
   const home = mkdtempSync(join(tmpdir(), 'shep-op-'))
   const source = new CoreSource({ home, port: 17887, session: 'test', socket: '/unused', binary: 'hc' })
   const operator = await startOperator(source, randomUUID())

@@ -6,12 +6,14 @@ import { CoreSource } from '../server/core/source.ts'
 import type { CoreAgent, CoreSpace } from '../server/core/model.ts'
 import { runChild } from './child.ts'
 
+const WINDOWS = process.platform === 'win32'
+
 /** Real private files through a fake core exec boundary, on GitHub only. Checker fakes are not UI proof. */
 async function fixture(run: (source: CoreSource, agent: CoreAgent, root: string, shots: { light: string; dark: string }) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'shep-artifacts-')), workspace = join(root, 'workspace')
   mkdirSync(workspace)
   const source = new CoreSource({ home: join(root, 'app'), port: 17887, session: 'test', socket: '/unused', binary: 'hc' })
-  const space = { id: 'p:machine:one', name: 'one', machine: 'machine', folder: workspace, base: 'main', prefix: 'ONE', mode: 'regular', added: 1 } as CoreSpace
+  const space = { id: 'p:machine:one', name: 'one', machine: source.localMachineId(), folder: workspace, base: 'main', prefix: 'ONE', mode: 'regular', added: 1 } as CoreSpace
   const agent: CoreAgent = { chat: space.id, space: space.id, machine: space.machine, role: 'coordinator', kind: 'claude', launch: 'launch', grant: 'grant', hook: '/unused', started: 1, state: 'idle' }
   agent.grant = source.mailbox.issue(agent.chat, agent.launch, agent.machine, ['artifact']).id
   source.agents.terminal = (() => ({ state: 'live', pid: 123 })) as unknown as typeof source.agents.terminal
@@ -85,10 +87,23 @@ test('a task agent\'s artifact gets the task\'s full name, once, and past the ti
 test('private files and symlink aliases cannot be imported', async () => fixture(async (source, agent, root) => {
   const cwd = source.space(agent.space)!.folder, privateFile = join(source.config.home, 'vault.txt')
   writeFileSync(privateFile, 'SYNTHETIC_PRIVATE_MATERIAL')
-  symlinkSync(privateFile, join(cwd, 'innocent.html'))
-  await expect(source.artifacts.cli(agent, ['artifact', 'new', 'innocent.html', '--title', 'Unsafe'], cwd)).rejects.toThrow('Private files')
+  let linked = true
+  try { symlinkSync(privateFile, join(cwd, 'innocent.html')) } catch (error) {
+    // Only Windows refusing the symlink privilege is an expected gap here; every other failure, on any platform,
+    // must fail this test rather than quietly drop the assertion.
+    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : undefined
+    if (!WINDOWS || code !== 'EPERM') throw error
+    linked = false
+    // Unverified, not faked: without SeCreateSymbolicLinkPrivilege the symlink case cannot be exercised here.
+    console.log('UNVERIFIED symlink: this Windows account cannot create a symbolic link; the hardlink case still runs')
+  }
+  // A symlink needs SeCreateSymbolicLinkPrivilege on Windows, so a plain account can only prove the hardlink case.
+  if (linked) {
+    // On Windows the helper refuses the reparse point before any path is resolved; POSIX resolves it into home first.
+    await expect(source.artifacts.cli(agent, ['artifact', 'new', 'innocent.html', '--title', 'Unsafe'], cwd)).rejects.toThrow(WINDOWS ? /reparse point/ : 'Private files')
+  }
   linkSync(privateFile, join(cwd, 'hardlink.html'))
-  await expect(source.artifacts.cli(agent, ['artifact', 'new', 'hardlink.html', '--title', 'Unsafe'], cwd)).rejects.toThrow('regular file')
+  await expect(source.artifacts.cli(agent, ['artifact', 'new', 'hardlink.html', '--title', 'Unsafe'], cwd)).rejects.toThrow(WINDOWS ? /more than one link/ : 'regular file')
   expect(source.artifacts.list()).toHaveLength(0)
 }))
 

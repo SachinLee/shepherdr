@@ -6,13 +6,14 @@ import { CoreSource } from '../server/core/source.ts'
 import type { CoreAgent, CoreSpace } from '../server/core/model.ts'
 
 async function fixture(run: (source: CoreSource, agent: CoreAgent) => Promise<void>) {
-  const home = mkdtempSync(join(tmpdir(), 'shep-secrets-'))
+  const root = mkdtempSync(join(tmpdir(), 'shep-secrets-'))
+  const home = join(root, 'state')
   const source = new CoreSource({ home, port: 17887, session: 'test', socket: '/unused', binary: 'hc' })
   const space = { id: 'p:machine:one', name: 'one', machine: 'machine', folder: '/unused', base: 'main', prefix: 'ONE', mode: 'regular', added: 1 } as CoreSpace
   const agent: CoreAgent = { chat: space.id, space: space.id, machine: space.machine, role: 'coordinator', kind: 'claude', launch: 'launch', grant: 'grant', hook: '/unused', started: 1, state: 'idle' }
   source.store.set('space', space.id, space); source.store.set('agent', agent.chat, agent)
   try { await run(source, agent) }
-  finally { source.stop(); source.mailbox.close(); source.store.close(); rmSync(home, { recursive: true, force: true }) }
+  finally { source.stop(); source.mailbox.close(); source.store.close(); rmSync(root, { recursive: true, force: true }) }
 }
 
 test('secret use derives scope from the authenticated session, ignoring claimed levels', async () => fixture(async (source, agent) => {
@@ -59,7 +60,11 @@ test('a secret saved in Settings closes every card it reaches, and only those', 
 
 test('corrupt vault diagnostics never echo stored material', async () => fixture(async (source) => {
   const fs = await import('node:fs')
-  fs.writeFileSync(join(source.config.home, 'vault.json'), 'DO_NOT_DISCLOSE invalid JSON', { mode: 0o600 })
+  const text = 'DO_NOT_DISCLOSE invalid JSON'
+  if (process.platform === 'win32') {
+    const { writePrivateFile } = await import('../server/core/windows-security.ts')
+    writePrivateFile(join(source.config.home, 'vault.json'), text)
+  } else fs.writeFileSync(join(source.config.home, 'vault.json'), text, { mode: 0o600 })
   expect(() => source.secrets.vault.pick(['KEY'], ['all'])).toThrow('fix or move')
   try { source.secrets.vault.pick(['KEY'], ['all']) } catch (error) { expect(String(error)).not.toContain('DO_NOT_DISCLOSE') }
 }))

@@ -1,6 +1,7 @@
 import { connect } from 'node:net'
 import { spawn } from 'node:child_process'
 import { Duplex } from 'node:stream'
+import { openWindowsPipe, WindowsPipeError, type WindowsPipeConnection } from './windows-pipe.ts'
 import { CORE_GENERATION, CORE_MINIMUM, FRAME, MAX_FRAME, FrameReader, coreVersionAccepted, encodeFrame, type CoreHello, type CoreNotification, type CoreSnapshot } from './protocol.ts'
 
 export class CoreError extends Error {
@@ -21,7 +22,8 @@ const otherGeneration = (what: string) => new CoreError('incompatible', `Shepher
 const tooOld = (version: unknown) => new CoreError('incompatible', `Shepherdr needs herdr-core ${CORE_MINIMUM} or newer; this core is ${version}. Run hc update, then start Shepherdr again.`)
 const lacking = (version: unknown, missing: string[]) => new CoreError('incompatible', `herdr-core ${version} lacks what Shepherdr needs: ${missing.join(', ')}. Update hc and Shepherdr, then start Shepherdr again.`)
 
-/** One local Unix socket. No shell, SSH bridge, screen parsing, or retry of uncertain writes. */
+/** One local endpoint: a Unix socket, or on Windows a local named pipe verified on its connected handle. No shell,
+ * SSH bridge, screen parsing, or retry of uncertain writes. */
 export class CoreClient {
   private socket: Duplex
   private next = 0
@@ -44,7 +46,21 @@ export class CoreClient {
     this.socket.on('close', () => this.fail(new CoreError('disconnected', 'Core disconnected; refresh state before continuing')))
   }
 
+  /** POSIX connects to the socket path directly. Windows pipes go through the fixed helper: it owns the one
+   * connected pipe handle from verification through relay, because Bun cannot hold or inspect that handle itself. */
   static async open(path: string): Promise<CoreClient> {
+    if (process.platform === 'win32') {
+      let connection: WindowsPipeConnection
+      try {
+        connection = await openWindowsPipe(path)
+      } catch (error) {
+        // A security refusal is permanent: retrying it only hides the reason, so it is reported as refused rather than
+        // as an unavailable core (which coreRequest retries until its deadline).
+        const refused = error instanceof WindowsPipeError && error.code === 'REFUSED'
+        throw new CoreError(refused ? 'refused' : 'unavailable', error instanceof Error ? error.message : String(error))
+      }
+      return this.negotiate(new CoreClient(path, connection.stream, connection.dispose))
+    }
     const client = new CoreClient(path)
     return this.negotiate(client)
   }

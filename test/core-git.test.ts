@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { CoreGit, githubRemote } from '../server/core/git.ts'
 import type { CoreFiles } from '../server/core/files.ts'
+import { pathRelation, samePath, worktreeEntries } from '../server/core/repository-paths.ts'
 
 test('GitHub remote forms retain their explicit host including legacy enterprise and rewritten hosts', () => {
   for (const url of ['git@github.company.test:owner/repo.git', 'ssh://git@github.company.test:2222/owner/repo.git', 'https://github.company.test/owner/repo.git/']) expect(githubRemote(url)).toBe('github.company.test/owner/repo')
@@ -59,6 +60,54 @@ test('reopening a task checkout checks the saved branch/location and preserves o
   branch = false
   await git.ensureWorktree(repo, '/tasks/one', 'work/one', 'main')
   expect(calls.at(-1)).toEqual(['git', 'worktree', 'add', '-b', 'work/one', '/tasks/one', 'main'])
+})
+
+test('native path comparison folds Windows case, separators and trailing dots but refuses unclear forms', () => {
+  expect(samePath('C:\\Work\\项目 一', 'c:/work/项目 一/')).toBe(true)
+  expect(samePath('C:\\Work\\项目 一.', 'C:\\work\\项目 一')).toBe(true)
+  expect(samePath('C:\\Work\\One', 'C:\\Work\\Oneed')).toBe(false)
+  expect(samePath('/tasks/one', '/tasks/one/')).toBe(true)
+  expect(samePath('/tasks/one', 'C:\\tasks\\one')).toBe(false)
+  expect(pathRelation('C:\\Work\\One', 'c:/work/one/sub/file.txt')).toBe('inside')
+  expect(pathRelation('C:\\Work\\One', 'D:\\Work\\One')).toBe('outside')
+  expect(pathRelation('C:\\Work\\One', '\\\\?\\C:\\Work\\One\\file.txt')).toBe('unknown')
+  expect(pathRelation('C:\\Work\\One', 'C:work\\one')).toBe('unknown')
+  expect(pathRelation('work/one', 'work/one/sub')).toBe('unknown')
+  expect(pathRelation('C:\\Work\\One', 'C:\\Work\\One\\bad:*')).toBe('unknown')
+  expect(worktreeEntries('worktree D:/任务 一/w\0HEAD ' + 'a'.repeat(40) + '\0branch refs/heads/w\0\0')).toEqual([
+    { path: 'D:/任务 一/w', head: 'a'.repeat(40), branch: 'refs/heads/w', bare: false, detached: false, locked: false, prunable: false },
+  ])
+})
+
+test('a saved Windows folder matches a -z worktree listing through separators, drive case and a non-ASCII name', async () => {
+  const sha = 'a'.repeat(40), ref = 'refs/heads/work/1-例子', calls: string[][] = []
+  let listing = ''
+  const git = new CoreGit({ exec: async (_machine: string, argv: string[]) => {
+    calls.push(argv)
+    if (argv[1] === 'worktree' && argv[2] === 'list') return Buffer.from(listing)
+    if (argv[1] === 'symbolic-ref') return Buffer.from(ref)
+    if (argv[1] === 'for-each-ref') return Buffer.from(`${ref} ${sha}`)
+    if (argv[1] === 'rev-parse') return Buffer.from(sha)
+    if (argv[1] === 'worktree' && argv[2] === 'add') return Buffer.alloc(0)
+    throw Error('Unexpected command')
+  } } as unknown as CoreFiles)
+  const repo = { machine: 'local', folder: 'D:\\repos\\项目 一\\repo' }, folder = 'd:\\REPOS\\项目 一\\repo\\work\\1-例子'
+  const entry = (path: string) => `worktree ${path}\0HEAD ${sha}\0branch ${ref}\0\0`
+  // Git prints `/` and keeps the on-disk drive case; the saved folder came from another call with another case.
+  listing = entry('D:/repos/项目 一/repo/work/1-例子')
+  await git.ensureWorktree(repo, folder, 'work/1-例子', 'main')
+  expect(calls.some(args => args.includes('add'))).toBe(false)
+  expect(calls.find(args => args.includes('--porcelain'))).toContain('-z')
+  // The same checkout listed twice is not a folder this code can act on.
+  listing += entry('d:/repos/项目 一/repo/work/1-例子')
+  await expect(git.ensureWorktree(repo, folder, 'work/1-例子', 'main')).rejects.toThrow('listed more than once')
+  // A device or otherwise uncomparable form is refused instead of read as "not this checkout".
+  listing = entry('\\\\?\\D:\\repos\\项目 一\\repo\\work\\1-例子')
+  await expect(git.ensureWorktree(repo, folder, 'work/1-例子', 'main')).rejects.toThrow('could not be compared')
+  // The branch still belongs to a checkout this task may not take over.
+  listing = entry('D:/repos/项目 一/repo/work/2-别的')
+  await expect(git.ensureWorktree(repo, folder, 'work/1-例子', 'main')).rejects.toThrow('checked out elsewhere')
+  expect(calls.some(args => args.includes('add'))).toBe(false)
 })
 
 test('basic PR identity omits restricted checks and open lookup refuses ambiguous or failed snapshots', async () => {

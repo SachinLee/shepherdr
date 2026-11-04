@@ -193,3 +193,20 @@ test('remote connect preserves its verified core homes when a tool shell changes
     await expect(client.call('server.status')).resolves.toEqual({})
   }, () => ({}), { environment: { XDG_RUNTIME_DIR: '/private/core-runtime', XDG_STATE_HOME: '/private/core-state', XDG_CONFIG_HOME: null }, inherited: { XDG_RUNTIME_DIR: '/other/runtime', XDG_STATE_HOME: undefined, XDG_CONFIG_HOME: '/other/config' } })
 })
+
+// Windows local cores are named pipes brokered by the fixed helper (server/core/windows-pipe.ts). These cases check the
+// refusal path only: they never start a core, so they stay fast and need no pipe.
+test.skipIf(process.platform !== 'win32')('a Windows file path is refused as a core endpoint instead of being connected', async () => {
+  const error = await CoreClient.open('C:\\Users\\public\\core.sock').catch(reason => reason)
+  expect(error.name).toBe('CoreError')
+  // A permanent refusal, not a core that may come back: retrying it (see coreRequest) would only hide the reason.
+  expect(error.kind).toBe('refused')
+  expect(error.message).toContain('local named pipe')
+})
+
+test.skipIf(process.platform !== 'win32')('a Windows pipe name that escapes the local pipe namespace is refused', async () => {
+  const error = await CoreClient.open('\\\\.\\pipe\\..\\evil').catch(reason => reason)
+  expect(error.name).toBe('CoreError')
+  expect(error.kind).toBe('refused')
+  expect(error.message).toContain('local named pipe')
+})

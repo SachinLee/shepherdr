@@ -34,6 +34,13 @@ Write meaningful unit, integration and layout regressions for GitHub. New UI cas
 belong in their topic's `layout-*.test.ts` file. Core protocol fakes test boundaries;
 they do not replace real native-agent or device acceptance.
 
+For the [Windows native preview](core/windows.md), keep elevated refusal checks
+separate from tests under a verified ordinary medium-integrity token. GitHub's
+Windows runner normally runs as administrator; a green job that skipped the
+ordinary-user cases is insufficient. The CI bootstrap creates its temporary user
+and isolated profile only on the disposable runner. Do not run those bootstrap
+scripts on this shared machine. Real provider acceptance remains a separate gate.
+
 Task IDs and workflow records live in the selected application's private SQLite
 store. Prefix/next-number changes are per repository space and only move forward.
 No 2.0 JSON/task-ID import is performed. See [state and cutover](core/cutover.md).

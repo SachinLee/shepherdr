@@ -3,7 +3,8 @@
 const OWN = ['help', 'show', 'models', 'set', 'unset', 'alert', 'space', 'task', 'status', 'ask', 'plan', 'review', 'pr', 'checks', 'ready', 'merge',
   'heartbeat', 'automation', 'todo', 'artifact', 'secret list', 'secret ask']
 
-/** Claude's allow rules for this exact path. A path a rule can't state literally gets none, never a wider rule. */
+/** Claude's allow rules for this exact path. A path a rule can't state literally gets none, never a wider rule; a
+ *  Windows path with a backslash or drive colon is outside this grammar, so it keeps every permission card. */
 export function ownRules(command: string) {
   if (!/^[\w@%+=:,./ -]+$/.test(command)) return []
   // A path with a space only works quoted, and Claude matches the quotes as written.

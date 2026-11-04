@@ -3,6 +3,7 @@
 import { appendFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { readCredential } from '../server/core/home.ts'
+import { verifyPrivateFile } from '../server/core/windows-security.ts'
 import { coreRequest } from '../server/core/request.ts'
 import type { CoreEndpoint } from '../server/core/client.ts'
 import { toolHash, type MailCredential } from '../server/core/envelope.ts'
@@ -25,6 +26,9 @@ try {
     transcript: cut(input.transcript_path, 4096), agent: cut(input.agent_id, 128), model: cut(input.model, 128), tool: cut(input.tool_name, 128), mode: cut(input.permission_mode, 32),
     use: cut(input.tool_use_id, 128), turn: cut(input.turn_id ?? input.prompt_id, 128), ...(input.tool_input === undefined ? {} : { input: toolHash(input.tool_input) }),
   }
+  // The launch created this file. Verify it again on Windows so a path swapped in by another account is never appended
+  // to; a failed check denies a permission request like any other transport failure.
+  if (process.platform === 'win32') verifyPrivateFile(hookFile)
   appendFileSync(hookFile, JSON.stringify(event) + '\n', { mode: 0o600 })
   if (permission) {
     const endpoint = credential.endpoint ?? credential.socket ?? (() => { throw new Error('Missing core endpoint') })()

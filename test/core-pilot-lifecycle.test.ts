@@ -106,3 +106,38 @@ test('a start where Autopilot cannot run refuses before touching the coordinator
   expect(() => new CorePilotLifecycle(source).start('space', {} as CorePilotConfig)).toThrow('runs macOS')
   expect(began).toBe(false)
 })
+
+test('this Windows machine refuses Autopilot before a policy, mode, grant or terminal', () => {
+  let began = false, emitted = 0, launched = 0
+  const space = { id: 'space', machine: 'machine', mode: 'regular' }
+  const source = {
+    store: { get: () => ({ id: 'machine' }) }, space: () => space, settings: { pilotBlock: () => undefined },
+    pilots: { policy: { begin() { began = true } } }, agents: { launch: async () => { launched++; return {} } }, emit: () => { emitted++ },
+  } as unknown as CoreSource
+  expect(() => new CorePilotLifecycle(source, 'win32').start('space', {} as CorePilotConfig)).toThrow('no unisolated agent and no WSL fallback')
+  expect(began).toBe(false)
+  expect(launched).toBe(0)
+  expect(emitted).toBe(0)
+  expect(space.mode).toBe('regular')
+})
+
+test('a Windows restart refuses before detaching the run or denying its permissions', () => {
+  let detached = 0, denied = 0
+  const run = { id: 'run', state: 'on', config: { harness: { kind: 'claude' } } }
+  const source = {
+    store: { get: () => ({ id: 'machine' }) }, space: () => ({ id: 'space', machine: 'machine', mode: 'autopilot' }),
+    pilots: { policy: { current: () => run, detachCoordinator: () => { detached++ } } },
+    agents: { get: () => ({ pilot: { run: 'run' } }) }, denyPermissions: () => { denied++ },
+  } as unknown as CoreSource
+  expect(() => new CorePilotLifecycle(source, 'win32').restart('space')).toThrow('Windows')
+  expect(detached).toBe(0)
+  expect(denied).toBe(0)
+})
+
+test('a remote target on a Windows host is not refused as if it were this machine', () => {
+  let began = false
+  const source = { store: { get: () => ({ id: 'machine' }) }, space: () => ({ id: 'space', machine: 'remote' }),
+    settings: { pilotBlock: () => 'remote wants a check' }, pilots: { policy: { begin() { began = true } } } } as unknown as CoreSource
+  expect(() => new CorePilotLifecycle(source, 'win32').start('space', {} as CorePilotConfig)).toThrow('remote wants a check')
+  expect(began).toBe(false)
+})

@@ -1,0 +1,12 @@
+- AGENTS.md — 本机只运行 typecheck，不改 README 设计、不自行发布、不使用真实私有状态。
+- docs/develop.md — 目录布局、隔离开发与 CI 验证要求。
+- docs/core/start.md — Bun 1.4.2、core >=0.1.14/gen1、手动生命周期、身份与 Linux Autopilot 契约。
+- server/core/config.ts — Unix 端点选择与环境清理，Windows 需要端点语义。
+- server/core/client.ts — framed core 协议、所需方法与远端 hc connect 接缝。
+- server/core/home.ts — 安装标记、mode 私有目录与凭据打开校验。
+- server/core/operator.ts — 本地私有操作通道与权限检查。
+- server/core/launcher.ts — 启动锁、身份探活、core 选择、后台进程与 SIGTERM 停止。
+- server/core/main.ts — 停止 drain 与 run.json 生命周期。
+- server/core/agents.ts — agent 参数、PATH、hook 与命令入口。
+- helper/core-worktree-includes.ts — 普通任务也会执行的私有文件校验。
+- .github/workflows/check.yml — 现有 Linux 检查与后续 Windows CI 入口。

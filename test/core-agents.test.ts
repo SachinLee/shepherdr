@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { CoreAgents } from '../server/core/agents.ts'
 import { CoreStore } from '../server/core/store.ts'
@@ -8,8 +8,16 @@ import type { CoreAgent } from '../server/core/model.ts'
 import type { CoreSession } from '../server/core/session.ts'
 import type { Mailbox } from '../server/core/mailbox.ts'
 
+// A Windows runner refuses these launches before a grant, so the POSIX launch shapes are proven where they run.
+const POSIX = process.platform !== 'win32'
+
+// CoreStore creates and protects a missing home itself, so every case below stays reachable on Windows. A mkdtemp
+// leaf already exists with the temp parent's inherited ACL, which a Windows store refuses before SQLite opens.
+function temporaryHome(prefix: string) { return join(mkdtempSync(join(tmpdir(), prefix)), 'home') }
+function removeHome(home: string) { rmSync(dirname(home), { recursive: true, force: true }) }
+
 test('late hooks cannot overwrite a replacement agent or erase its confirmed terminal', () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-agent-race-'))
+  const home = temporaryHome('shep-agent-race-')
   const store = new CoreStore(home)
   try {
     const agents = new CoreAgents({ home, port: 17887, session: 'test', socket: '/unused', binary: 'hc' },
@@ -29,11 +37,11 @@ test('late hooks cannot overwrite a replacement agent or erase its confirmed ter
     store.set('agent', 'chat', replacement)
     agents.hook(first, { id: 'event-late', event: 'SessionEnd', at: 3, session: 'old-native' })
     expect(agents.get('chat')).toEqual(replacement)
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })
 
 test('the end of a session that never began leaves its start unfinished', () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-agent-end-'))
+  const home = temporaryHome('shep-agent-end-')
   const store = new CoreStore(home)
   try {
     const agents = new CoreAgents({ home, port: 17887, session: 'test', socket: '/unused', binary: 'hc' },
@@ -45,11 +53,11 @@ test('the end of a session that never began leaves its start unfinished', () => 
     agents.hook(record, { id: 'start', event: 'SessionStart', at: 3, session: 'gone' })
     agents.hook(record, { id: 'end-two', event: 'SessionEnd', at: 4, session: 'gone' })
     expect(agents.get('chat')?.state).toBe('idle')
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })
 
-test('terminal confirmation preserves hooks received while terminal.run was pending', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-agent-start-'))
+test.skipIf(!POSIX)('terminal confirmation preserves hooks received while terminal.run was pending', async () => {
+  const home = temporaryHome('shep-agent-start-')
   const store = new CoreStore(home)
   try {
     let agents: CoreAgents
@@ -66,12 +74,12 @@ test('terminal confirmation preserves hooks received while terminal.run was pend
     expect(result).toMatchObject({ terminal: 't1', pid: 123, state: 'idle', session: 'native-session', transcript: '/native.jsonl' })
     agents.hook(result, { id: 'answered-permission', event: 'PermissionRequest', at: Date.now() })
     expect(agents.get('chat')?.permission).toBeUndefined()
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })
 
 
-test('read-only Codex reviewers capture native JSON events without bypassing hook trust', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-review-start-')), store = new CoreStore(home)
+test.skipIf(!POSIX)('read-only Codex reviewers capture native JSON events without bypassing hook trust', async () => {
+  const home = temporaryHome('shep-review-start-'), store = new CoreStore(home)
   try {
     let argv: string[] = []
     const core = { call: async (_method: string, input: { argv: string[] }) => { argv = input.argv; return { address: 't1', pid: 123 } } } as unknown as CoreSession
@@ -87,11 +95,30 @@ test('read-only Codex reviewers capture native JSON events without bypassing hoo
     expect(launch.argv).not.toContain('sandbox_workspace_write.network_access=true')
     expect(launch.argv.some((word: string) => word.startsWith('hooks.'))).toBe(false)
     expect(result).toMatchObject({ transcript: launch.log, transcriptFormat: 'codex-exec', state: 'working' })
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })
 
-test('a picked speed reaches each CLI in its own words, for that launch only', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-speed-start-')), store = new CoreStore(home)
+test.skipIf(!POSIX)('a POSIX launch keeps the colon PATH and the single-quoted hook command', async () => {
+  const home = temporaryHome('shep-agent-posix-'), store = new CoreStore(home)
+  try {
+    let env: Record<string, string> = {}, settings = ''
+    const core = { call: async (_method: string, input: { argv: string[]; env: Record<string, string> }) => {
+      env = input.env; settings = input.argv[input.argv.indexOf('--settings') + 1]; return { address: 't1', pid: 123 }
+    } } as unknown as CoreSession
+    const mailbox = { issue: () => ({ id: 'posix-grant', credential: {} }) } as unknown as Mailbox
+    store.set('meta', 'local', { id: 'machine' })
+    const agents = new CoreAgents({ home, port: 17887, session: 'test', socket: '/unused', binary: 'hc' },
+      { format: 'shepherdr-core', schema: 1, id: 'installation' }, core, store, mailbox, async () => undefined, () => {})
+    await agents.launch({ id: 'space', name: 'Example', machine: 'machine', folder: '/unused', base: 'main', prefix: 'EX', mode: 'regular', added: 1 }, 'chat', 'claude', 'Wait')
+    expect(env.PATH.startsWith(join(import.meta.dir, '..', 'bin') + ':')).toBe(true)
+    expect(env.PATH).not.toContain(';')
+    const command = JSON.parse(readFileSync(settings, 'utf8')).hooks.SessionStart[0].hooks[0].command as string
+    expect(command).toMatch(/^'.*' '.*core-hook\.ts'$/)
+  } finally { store.close(); removeHome(home) }
+})
+
+test.skipIf(!POSIX)('a picked speed reaches each CLI in its own words, for that launch only', async () => {
+  const home = temporaryHome('shep-speed-start-'), store = new CoreStore(home)
   try {
     let argv: string[] = [], count = 0
     const core = { current: { terminals: new Map() }, call: async (_method: string, input: { argv: string[] }) => { argv = input.argv; return { address: `t${++count}`, pid: count } } } as unknown as CoreSession
@@ -106,11 +133,11 @@ test('a picked speed reaches each CLI in its own words, for that launch only', a
     expect(await start('e', 'codex', 'normal')).toContain('service_tier="default"')
     expect(await start('f', 'codex')).not.toContain('service_tier')
     expect(store.get('agent', 'd')).toMatchObject({ speed: 'fast' })
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })
 
-test('ordinary replacement preserves both private launch identities for later descendant cleanup', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-ordinary-history-')), store = new CoreStore(home)
+test.skipIf(!POSIX)('ordinary replacement preserves both private launch identities for later descendant cleanup', async () => {
+  const home = temporaryHome('shep-ordinary-history-'), store = new CoreStore(home)
   try {
     const terminals = new Map<string, import('../server/core/protocol.ts').CoreTerminal>()
     let count = 0, launchWords: string[] = []
@@ -133,11 +160,11 @@ test('ordinary replacement preserves both private launch identities for later de
     expect(store.get('agent-launch', first.launch)).toMatchObject({ terminal: 't1', pid: 10, role: 'task' })
     expect(store.get('agent-launch', second.launch)).toMatchObject({ terminal: 't2', pid: 20, role: 'task' })
     expect(store.all('pilot-capture')).toHaveLength(0)
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })
 
-for (const kind of ['claude', 'codex'] as const) test(`${kind} coordinator launch includes house rules, full role guide and authoritative core routing`, async () => {
-  const home = mkdtempSync(join(tmpdir(), 'shep-agent-guide-')), store = new CoreStore(home)
+for (const kind of ['claude', 'codex'] as const) test.skipIf(!POSIX)(`${kind} coordinator launch includes house rules, full role guide and authoritative core routing`, async () => {
+  const home = temporaryHome('shep-agent-guide-'), store = new CoreStore(home)
   try {
     let argv: string[] = [], env: Record<string, string> = {}
     const core = { call: async (_method: string, input: { argv: string[]; env: Record<string, string> }) => { argv = input.argv; env = input.env; return { address: 't1', pid: 123 } } } as unknown as CoreSession
@@ -167,5 +194,5 @@ for (const kind of ['claude', 'codex'] as const) test(`${kind} coordinator launc
       expect(argv).not.toContain('--permission-mode')
       expect(argv).not.toContain('--dangerously-skip-permissions')
     }
-  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+  } finally { store.close(); removeHome(home) }
 })

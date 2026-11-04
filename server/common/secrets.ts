@@ -5,9 +5,11 @@
 // The application is the sole vault writer. Agent use leaves over its authenticated encrypted core mailbox; snapshots contain names only.
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { preparePrivateDirectory, readPrivateFile, WindowsSecurityError, writePrivateFile } from '../core/windows-security.ts'
 import type { SettingSection } from '../../shared/types.ts'
 
 const FILE = 'vault.json'
+const WINDOWS = process.platform === 'win32'
 
 /** a name an environment variable may have: GITHUB_TOKEN */
 export const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/
@@ -40,8 +42,10 @@ export class Vault {
     const f = join(this.home, FILE)
     if (!existsSync(f)) return {}
     try {
-      return JSON.parse(readFileSync(f, 'utf8')) as Store
+      return JSON.parse(WINDOWS ? readPrivateFile(f) : readFileSync(f, 'utf8')) as Store
     } catch (e) {
+      // A security refusal keeps its own reason; anything else gets the actionable "fix or move" wording.
+      if (e instanceof WindowsSecurityError) throw e
       throw new Error(`Secrets can't be read from ${f} : fix or move that file; nothing was changed.`)
     }
   }
@@ -85,8 +89,13 @@ export class Vault {
 
   /** written whole, readable by you only, from the start: a new file each time, then put in place */
   private write(all: Store) {
-    mkdirSync(this.home, { recursive: true, mode: 0o700 })
     const f = join(this.home, FILE)
+    if (WINDOWS) {
+      preparePrivateDirectory(this.home)
+      writePrivateFile(f, JSON.stringify(all, null, 2))
+      return
+    }
+    mkdirSync(this.home, { recursive: true, mode: 0o700 })
     const tmp = `${f}.${process.pid}.tmp`
     writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 })
     renameSync(tmp, f)
